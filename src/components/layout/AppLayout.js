@@ -13,6 +13,7 @@ import {
   Drawer,
   List,
   ListItem,
+  ListItemButton,
   ListItemIcon,
   ListItemText,
   Avatar,
@@ -36,7 +37,7 @@ import {
 import { getAuth, signOut } from 'firebase/auth';
 
 // Layout component that wraps the entire application
-const AppLayout = ({ children, user, toggleThemeMode, themeMode }) => {
+const AppLayout = ({ children, user, toggleThemeMode, themeMode, onNavigateToDashboard }) => {
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'));
   const [drawerOpen, setDrawerOpen] = useState(!isMobile);
@@ -101,11 +102,22 @@ const AppLayout = ({ children, user, toggleThemeMode, themeMode }) => {
       </Box>
       <Divider />
       <List>
-        <ListItem button>
-          <ListItemIcon>
-            <DashboardIcon />
-          </ListItemIcon>
-          <ListItemText primary="Dashboard" />
+        <ListItem disablePadding>
+          <ListItemButton onClick={() => {
+            // Close drawer on mobile after navigation
+            if (isMobile) setDrawerOpen(false);
+            // Navigate to dashboard - force navigation to dashboard by setting selectedGroupId to null
+            if (onNavigateToDashboard) {
+              onNavigateToDashboard();
+              // Add console log to debug
+              console.log('Dashboard button clicked, navigating to dashboard');
+            }
+          }}>
+            <ListItemIcon>
+              <DashboardIcon />
+            </ListItemIcon>
+            <ListItemText primary="Dashboard" />
+          </ListItemButton>
         </ListItem>
       </List>
       <Divider />

@@ -46,6 +46,7 @@ export default function App() {
 
   // Handle back navigation from group details
   const handleBackToGroups = () => {
+    console.log('Navigating back to dashboard');
     setSelectedGroupId(null);
   };
 
@@ -97,6 +98,7 @@ export default function App() {
         user={user} 
         toggleThemeMode={toggleThemeMode} 
         themeMode={themeMode}
+        onNavigateToDashboard={handleBackToGroups} // Use the existing back handler to navigate to dashboard
       >
         {mainContent}
       </AppLayout>

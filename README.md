@@ -38,7 +38,7 @@ This app helps you manage chit fund groups with an intuitive dashboard and clear
 
 ---
 
-## Recent Fixes & Improvements (April 2025)
+## Recent Fixes & Improvements (May 2025)
 
 ### Variable Payout Groups
 - The Winner Payout Schedule now correctly uses a formula for variable chit groups, instead of always showing the lumpsum value.
@@ -54,9 +54,15 @@ This app helps you manage chit fund groups with an intuitive dashboard and clear
 - If you change a group's chit type, make sure to save and reload to see the updated payout logic.
 - All debug code and logs have been removed for production use, but you can add them back for troubleshooting if needed.
 
+### Navigation Improvements
+- The Dashboard button in the sidebar now properly navigates users back to the dashboard from any page.
+- On mobile devices, the sidebar automatically closes after navigation for a better user experience.
+- This provides a consistent way to return to the main dashboard view from anywhere in the application.
+
 ### Learning Notes
 - This project demonstrates how to use React state and Firestore together for dynamic business logic.
 - The codebase is commented for learners, especially around tricky logic like payout calculations and form state.
+- The navigation system shows proper implementation of Material UI v5 components and React state management.
 
 ---
 
