@@ -1,0 +1,694 @@
+// src/components/ui/GroupDetails.js
+// Mobile-optimized group details component with improved UI/UX
+
+import React, { useEffect, useState } from 'react';
+import { 
+  Box, 
+  Typography, 
+  Button, 
+  Paper, 
+  Grid, 
+  Divider, 
+  Chip, 
+  IconButton, 
+  Tooltip, 
+  Alert, 
+  CircularProgress, 
+  Tabs, 
+  Tab, 
+  Card, 
+  CardContent,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  useTheme,
+  useMediaQuery,
+  Fade,
+  Breadcrumbs,
+  Link,
+  Skeleton
+} from '@mui/material';
+import {
+  ArrowBack as BackIcon,
+  Edit as EditIcon,
+  Archive as ArchiveIcon,
+  Restore as RestoreIcon,
+  Delete as DeleteIcon,
+  ContentCopy as DuplicateIcon,
+  Group as MembersIcon,
+  CalendarToday as ScheduleIcon,
+  Info as InfoIcon
+} from '@mui/icons-material';
+import { doc, getDoc, updateDoc, deleteDoc, addDoc, collection } from 'firebase/firestore';
+import { db } from '../../firebase';
+import GroupMembers from '../GroupMembers';
+import PaymentSchedule from '../PaymentSchedule';
+import EditGroupForm from '../EditGroupForm';
+
+// Helper function to format currency
+const formatCurrency = (amount) => {
+  return new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 0
+  }).format(amount);
+};
+
+// Helper function to format date
+const formatDate = (dateString) => {
+  if (!dateString) return 'Not set';
+  try {
+    return new Date(dateString + '-01').toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long'
+    });
+  } catch (e) {
+    return dateString;
+  }
+};
+
+/**
+ * Enhanced GroupDetails Component
+ * Features:
+ * - Tabbed interface for better organization
+ * - Responsive design for all screen sizes
+ * - Improved visual hierarchy and information display
+ * - Confirmation dialogs for destructive actions
+ * - Loading states and error handling
+ */
+export default function GroupDetails({ groupId, onBack, refreshGroups }) {
+  // All hooks must be called at the top! (No conditional returns before this)
+  const theme = useTheme();
+  const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
+  const [group, setGroup] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [members, setMembers] = useState([]);
+  const [error, setError] = useState('');
+  const [locked, setLocked] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [archiveMode, setArchiveMode] = useState(false);
+  const [canDeleteForever, setCanDeleteForever] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
+  const [newGroupId, setNewGroupId] = useState(null);
+  const [activeTab, setActiveTab] = useState(0);
+  const [confirmArchive, setConfirmArchive] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmRestore, setConfirmRestore] = useState(false);
+  // Use the current local time provided by the system
+  const currentTime = new Date('2025-05-01T22:48:17+05:30');
+
+  // Display the groupId for debugging
+  const debugBanner = <div style={{background:'#ffe082',color:'#333',padding:'6px 16px',margin:'8px 0',borderRadius:4,fontWeight:'bold'}}>Debug: GroupDetails loaded with groupId: {groupId}</div>;
+
+  // Single useEffect for all group data fetching
+  useEffect(() => {
+    console.log('GroupDetails useEffect running with groupId:', groupId);
+    
+    // Handle missing/invalid groupId
+    if (!groupId) {
+      console.log('No group ID provided to GroupDetails');
+      setError('No group selected.');
+      setLoading(false);
+      return;
+    }
+    
+    // If we just duplicated, fetch the new group for editing
+    if (newGroupId) {
+      async function fetchNewGroup() {
+        setLoading(true);
+        try {
+          const docRef = doc(db, 'chitGroups', newGroupId);
+          const docSnap = await getDoc(docRef);
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            setGroup({ id: docSnap.id, ...data });
+            setEditing(true);
+            setArchiveMode(false);
+            setMembers([]); // No members for new group
+            setLocked(false);
+          } else {
+            setError('Duplicated group not found.');
+          }
+        } catch (err) {
+          setError('Failed to fetch duplicated group.');
+        } finally {
+          setLoading(false);
+        }
+      }
+      fetchNewGroup();
+      setNewGroupId(null); // Reset for next time
+    } else {
+      // Normal group fetch
+      async function fetchGroup() {
+        console.log('Attempting to fetch group with ID:', groupId);
+        setLoading(true);
+        try {
+          const docRef = doc(db, 'chitGroups', groupId);
+          console.log('Created document reference:', docRef);
+          const docSnap = await getDoc(docRef);
+          console.log('Document snapshot retrieved:', docSnap);
+          if (docSnap.exists()) {
+            console.log('Document exists, retrieving data');
+            const data = docSnap.data();
+            console.log('Group data retrieved:', data);
+            setGroup({ id: docSnap.id, ...data });
+            
+            // Check if group is archived
+            setArchiveMode(data.archived || false);
+            
+            // Check if group can be deleted forever (archived > 1 month ago)
+            if (data.archived && data.archivedAt) {
+              const archivedDate = new Date(data.archivedAt.seconds * 1000);
+              const oneMonthAgo = new Date();
+              oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+              setCanDeleteForever(archivedDate < oneMonthAgo);
+            }
+            
+            // Set members if available
+            if (data.members && Array.isArray(data.members)) {
+              setMembers(data.members);
+            }
+            
+            // Check if members are locked
+            setLocked(data.membersLocked || false);
+          } else {
+            console.log('No such document!');
+            setError('Group not found.');
+          }
+        } catch (err) {
+          console.error('Error fetching group:', err);
+          setError('Failed to fetch group details.');
+        } finally {
+          setLoading(false);
+        }
+      }
+      fetchGroup();
+    }
+  }, [groupId, editing, duplicating, newGroupId, currentTime]);
+
+  // Now handle missing groupId after all hooks
+  if (!groupId) {
+    return <div style={{color: 'red', fontWeight: 'bold', padding: 24}}>No groupId provided to GroupDetails component!</div>;
+  }
+
+  // Handle members change
+  const handleMembersChange = (updatedMembers) => {
+    setMembers(updatedMembers);
+  };
+
+  // Handle locking members
+  const handleLockMembers = () => {
+    setLocked(true);
+  };
+
+  // Handle edit save
+  const handleEditSave = (updated) => {
+    setGroup(updated);
+    setEditing(false);
+    
+    // Refresh the groups list in the parent component
+    if (refreshGroups) {
+      refreshGroups();
+    }
+  };
+
+  // Handle archive
+  const handleArchive = async () => {
+    try {
+      const docRef = doc(db, 'chitGroups', groupId);
+      await updateDoc(docRef, { 
+        archived: true,
+        archivedAt: new Date()
+      });
+      setArchiveMode(true);
+      setConfirmArchive(false);
+    } catch (err) {
+      setError('Failed to archive group.');
+    }
+  };
+
+  // Handle restore
+  const handleRestore = async () => {
+    try {
+      const docRef = doc(db, 'chitGroups', groupId);
+      await updateDoc(docRef, { 
+        archived: false,
+        archivedAt: null
+      });
+      setArchiveMode(false);
+      setConfirmRestore(false);
+    } catch (err) {
+      setError('Failed to restore group.');
+    }
+  };
+
+  // Permanently delete the group (only enabled if archived for >1 month)
+  const handleDeleteForever = async () => {
+    if (!canDeleteForever) return;
+    
+    setDeleting(true);
+    try {
+      const docRef = doc(db, 'chitGroups', groupId);
+      await deleteDoc(docRef);
+      setConfirmDelete(false);
+      
+      // Go back to the groups list
+      if (onBack) onBack();
+    } catch (err) {
+      setError('Failed to delete group.');
+      setDeleting(false);
+    }
+  };
+
+  // Duplicate group: create a new group with same properties, then open edit form
+  const handleDuplicate = async () => {
+    if (!group) return;
+    
+    setDuplicating(true);
+    try {
+      // Create a copy of the group data without the id, archived status, and members
+      const { 
+        id, 
+        archived, 
+        archivedAt, 
+        members, 
+        membersLocked,
+        ...groupData 
+      } = group;
+      
+      // Add "Copy of" to the name
+      const newGroupData = {
+        ...groupData,
+        name: `Copy of ${group.name}`,
+        createdAt: new Date(),
+        // Reset any other fields that should be fresh in the copy
+        membersLocked: false
+      };
+      
+      // Create the new group in Firestore
+      const docRef = await addDoc(collection(db, 'chitGroups'), newGroupData);
+      
+      // Set the new group ID to trigger fetching it
+      setNewGroupId(docRef.id);
+      
+      // Refresh the groups list in the parent component
+      if (refreshGroups) {
+        refreshGroups();
+      }
+    } catch (err) {
+      setError('Failed to duplicate group.');
+      setDuplicating(false);
+    }
+  };
+
+  // Handle tab change
+  const handleTabChange = (event, newValue) => {
+    setActiveTab(newValue);
+  };
+
+  if (editing) {
+    return (
+      <>
+        {debugBanner}
+        <Box sx={{ p: 3 }}>
+          <Button 
+            startIcon={<BackIcon />} 
+            onClick={() => setEditing(false)}
+            sx={{ mb: 3 }}
+          >
+            Back to Group
+          </Button>
+          <EditGroupForm 
+            initial={JSON.parse(JSON.stringify(group))}
+            onSave={handleEditSave}
+            onCancel={() => setEditing(false)}
+          />
+        </Box>
+      </>
+    );
+  }
+  
+  return (
+    <>
+      {debugBanner}
+      <Box sx={{ maxWidth: 900, mx: 'auto', mt: { xs: 2, sm: 4 }, mb: 4 }}>
+      {/* Breadcrumb navigation */}
+      <Breadcrumbs sx={{ mb: 1.5, px: { xs: 1, sm: 0 }, fontSize: { xs: '0.85rem', sm: '1rem' } }}>
+        <Link 
+          component="button" 
+          onClick={onBack}
+          underline="hover"
+          color="inherit"
+          sx={{ display: 'flex', alignItems: 'center' }}
+        >
+          Dashboard
+        </Link>
+        <Typography color="text.primary" sx={{ fontWeight: 'medium' }}>
+          {group ? group.name : 'Group Details'}
+        </Typography>
+      </Breadcrumbs>
+      
+      {/* Error Alert */}
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      )}
+      
+      {/* Debug output for state */}
+      <Box sx={{ p: 2, mb: 2, background: '#f5f5f5', color: '#444', border: '1px dashed #aaa', fontSize: 14 }}>
+        <strong>Debug State:</strong><br/>
+        loading: {String(loading)}<br/>
+        group: {group ? JSON.stringify(group) : 'null'}<br/>
+        error: {error || 'none'}
+      </Box>
+      {loading ? (
+        <Box sx={{ p: 3 }}>
+          <Skeleton variant="rectangular" height={200} sx={{ mb: 2, borderRadius: 2 }} />
+          <Skeleton variant="text" height={60} sx={{ mb: 1 }} />
+          <Skeleton variant="text" height={30} width="60%" />
+        </Box>
+      ) : group ? (
+        <>
+          {/* Group Header */}
+          <Paper 
+            elevation={2} 
+            sx={{ 
+              p: { xs: 2, sm: 3 }, 
+              mb: 3, 
+              borderRadius: 2,
+              position: 'relative',
+              bgcolor: archiveMode ? 'grey.100' : 'background.paper'
+            }}
+          >
+            {/* Archive Badge */}
+            {archiveMode && (
+              <Chip 
+                label="Archived" 
+                color="default"
+                size="small"
+                sx={{ 
+                  position: 'absolute', 
+                  top: 16, 
+                  right: 16,
+                  bgcolor: 'grey.400',
+                  color: 'white'
+                }}
+              />
+            )}
+            
+            <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, justifyContent: 'space-between', mb: 2 }}>
+              <Box>
+                <Typography variant="h4" component="h1" sx={{ fontSize: { xs: '1.5rem', sm: '2rem' }, mb: 1, pr: { xs: 0, sm: 8 } }}>
+                  {group.name}
+                </Typography>
+                
+                <Typography variant="body1" color="text.secondary" sx={{ mb: 2 }}>
+                  {group.description || 'No description provided'}
+                </Typography>
+              </Box>
+              
+              {/* Action Buttons */}
+              <Box sx={{ display: 'flex', gap: 1, mt: { xs: 2, sm: 0 }, flexWrap: 'wrap' }}>
+                {!archiveMode && (
+                  <>
+                    <Button 
+                      startIcon={<EditIcon />} 
+                      variant="outlined" 
+                      onClick={() => setEditing(true)}
+                      size={isMobile ? 'small' : 'medium'}
+                    >
+                      Edit
+                    </Button>
+                    <Button 
+                      startIcon={<ArchiveIcon />} 
+                      variant="outlined" 
+                      color="warning"
+                      onClick={() => setConfirmArchive(true)}
+                      size={isMobile ? 'small' : 'medium'}
+                    >
+                      Archive
+                    </Button>
+                  </>
+                )}
+                
+                {archiveMode && (
+                  <>
+                    <Button 
+                      startIcon={<RestoreIcon />} 
+                      variant="outlined" 
+                      color="primary"
+                      onClick={() => setConfirmRestore(true)}
+                      size={isMobile ? 'small' : 'medium'}
+                    >
+                      Restore
+                    </Button>
+                    <Button 
+                      startIcon={<DeleteIcon />} 
+                      variant="outlined" 
+                      color="error"
+                      onClick={() => setConfirmDelete(true)}
+                      disabled={!canDeleteForever}
+                      size={isMobile ? 'small' : 'medium'}
+                    >
+                      Delete
+                    </Button>
+                  </>
+                )}
+                
+                <Button 
+                  startIcon={<DuplicateIcon />} 
+                  variant="outlined" 
+                  color="info"
+                  onClick={handleDuplicate}
+                  disabled={duplicating}
+                  size={isMobile ? 'small' : 'medium'}
+                >
+                  {duplicating ? 'Duplicating...' : 'Duplicate'}
+                </Button>
+              </Box>
+            </Box>
+            
+            <Divider sx={{ mb: 2 }} />
+            
+            {/* Group Info Cards */}
+            <Grid container spacing={2} sx={{ mb: 3 }}>
+              <Grid item xs={12} sm={6} md={3}>
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography color="text.secondary" gutterBottom>
+                      Type
+                    </Typography>
+                    <Typography variant="h6">
+                      {group.chitType === 'constant' ? 'Fixed Value' : 'Auction'}
+                    </Typography>
+                  </CardContent>
+                </Card>
+              </Grid>
+              
+              <Grid item xs={12} sm={6} md={3}>
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography color="text.secondary" gutterBottom>
+                      Value
+                    </Typography>
+                    <Typography variant="h6">
+                      {formatCurrency(group.lumpsum)}
+                    </Typography>
+                  </CardContent>
+                </Card>
+              </Grid>
+              
+              <Grid item xs={12} sm={6} md={3}>
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography color="text.secondary" gutterBottom>
+                      Duration
+                    </Typography>
+                    <Typography variant="h6">
+                      {group.months} months
+                    </Typography>
+                  </CardContent>
+                </Card>
+              </Grid>
+              
+              <Grid item xs={12} sm={6} md={3}>
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography color="text.secondary" gutterBottom>
+                      Start Date
+                    </Typography>
+                    <Typography variant="h6">
+                      {formatDate(group.startMonth)}
+                    </Typography>
+                  </CardContent>
+                </Card>
+              </Grid>
+            </Grid>
+            
+            {/* Additional Info */}
+            <Grid container spacing={2}>
+              <Grid item xs={12} sm={6}>
+                <Typography variant="body2" color="text.secondary">
+                  <strong>Payment Day:</strong> {group.dueDay || 'Not set'}
+                </Typography>
+              </Grid>
+              
+              <Grid item xs={12} sm={6}>
+                <Typography variant="body2" color="text.secondary">
+                  <strong>Members:</strong> {members.length} {locked ? '(Locked)' : '(Unlocked)'}
+                </Typography>
+              </Grid>
+              
+              {group.chitType === 'auction' && (
+                <Grid item xs={12} sm={6}>
+                  <Typography variant="body2" color="text.secondary">
+                    <strong>Commission:</strong> {group.commissionPercent || 5}%
+                  </Typography>
+                </Grid>
+              )}
+            </Grid>
+          </Paper>
+          
+          {/* Tabs for Members and Schedule */}
+          <Box sx={{ mb: 2 }}>
+            <Tabs 
+              value={activeTab} 
+              onChange={handleTabChange}
+              variant={isMobile ? "fullWidth" : "standard"}
+              sx={{ 
+                borderBottom: 1, 
+                borderColor: 'divider',
+                '& .MuiTab-root': {
+                  fontSize: { xs: '0.85rem', sm: '0.95rem' }
+                }
+              }}
+            >
+              <Tab 
+                icon={<MembersIcon />} 
+                iconPosition="start" 
+                label="Members" 
+                id="tab-0" 
+                aria-controls="tabpanel-0" 
+              />
+              <Tab 
+                icon={<ScheduleIcon />} 
+                iconPosition="start" 
+                label="Payment Schedule" 
+                id="tab-1" 
+                aria-controls="tabpanel-1" 
+                disabled={!group.startMonth || !group.dueDay}
+              />
+            </Tabs>
+          </Box>
+          
+          <Box role="tabpanel" hidden={activeTab !== 0} id="tabpanel-0" aria-labelledby="tab-0">
+            {activeTab === 0 && (
+              <Fade in={true} timeout={500}>
+                <Box>
+                  <GroupMembers
+                    groupId={group.id}
+                    members={members}
+                    onMembersChange={handleMembersChange}
+                    locked={locked}
+                  />
+                </Box>
+              </Fade>
+            )}
+          </Box>
+          
+          <Box role="tabpanel" hidden={activeTab !== 1} id="tabpanel-1" aria-labelledby="tab-1">
+            {activeTab === 1 && group.startMonth && group.dueDay && (
+              <Fade in={true} timeout={500}>
+                <Box>
+                  <PaymentSchedule
+                    key={`${group.months}-${members.length}-${group.lumpsum}`}
+                    groupId={group.id}
+                    members={members}
+                    months={group.months || 12}
+                    lumpsum={group.lumpsum}
+                    onLockMembers={handleLockMembers}
+                    startMonth={group.startMonth}
+                    dueDay={group.dueDay}
+                    paymentBuckets={group.paymentBuckets}
+                    chitType={group.chitType}
+                    commissionPercent={group.commissionPercent}
+                    manualPayinSchedule={group.manualPayinSchedule}
+                    manualPayoutSchedule={group.manualPayoutSchedule}
+                  />
+                </Box>
+              </Fade>
+            )}
+          </Box>
+          
+          {/* Error Display */}
+          {error && (
+            <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>
+          )}
+          
+          {/* Confirmation Dialogs */}
+          {/* Archive Confirmation */}
+          <Dialog open={confirmArchive} onClose={() => setConfirmArchive(false)}>
+            <DialogTitle>Archive Group</DialogTitle>
+            <DialogContent>
+              <Typography>
+                Are you sure you want to archive this group? You can restore it within 1 month.
+              </Typography>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setConfirmArchive(false)}>Cancel</Button>
+              <Button onClick={handleArchive} color="error" variant="contained">
+                Archive
+              </Button>
+            </DialogActions>
+          </Dialog>
+          
+          {/* Restore Confirmation */}
+          <Dialog open={confirmRestore} onClose={() => setConfirmRestore(false)}>
+            <DialogTitle>Restore Group</DialogTitle>
+            <DialogContent>
+              <Typography>
+                Are you sure you want to restore this group? It will be moved back to your active groups.
+              </Typography>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setConfirmRestore(false)}>Cancel</Button>
+              <Button onClick={handleRestore} color="primary" variant="contained">
+                Restore
+              </Button>
+            </DialogActions>
+          </Dialog>
+          
+          {/* Delete Confirmation */}
+          <Dialog open={confirmDelete} onClose={() => setConfirmDelete(false)}>
+            <DialogTitle>Delete Group Permanently</DialogTitle>
+            <DialogContent>
+              <Typography color="error" paragraph>
+                Warning: This action cannot be undone.
+              </Typography>
+              <Typography>
+                Are you sure you want to permanently delete this group? All data associated with this group will be lost.
+              </Typography>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setConfirmDelete(false)}>Cancel</Button>
+              <Button 
+                onClick={handleDeleteForever} 
+                color="error" 
+                variant="contained"
+                disabled={!canDeleteForever || deleting}
+              >
+                {deleting ? 'Deleting...' : 'Delete Forever'}
+              </Button>
+            </DialogActions>
+          </Dialog>
+        </>
+      ) : (
+        <Alert severity="error">Group not found or has been deleted.</Alert>
+      )}
+    </Box>
+    </>
+  );
+}

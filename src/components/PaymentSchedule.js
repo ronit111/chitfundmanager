@@ -1,0 +1,605 @@
+// src/components/PaymentSchedule.js
+// Handles monthly payments and winner selection for each chit group
+
+import React, { useEffect, useState } from 'react';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
+import { db } from '../firebase';
+
+// Helper functions
+function getInitialPayments(members, months) {
+  // Returns an array of objects for each month: { month: 1, payments: [{memberName, paid:false, amount:null}], winner: null }
+  return Array.from({ length: months }, (_, i) => ({
+    month: i + 1,
+    payments: members.map(m => ({ memberName: m.name, paid: false, amount: null })),
+    winner: null
+  }));
+}
+
+function getDueDate(startMonth, dueDay, monthIdx) {
+  // Ensure startMonth is a non-empty string and dueDay is provided
+  if (!startMonth || typeof startMonth !== 'string' || !dueDay) return null;
+  // Split startMonth string (e.g., '2025-05') into year and month
+  const [startYear, startMon] = startMonth.split('-').map(Number);
+  // Check that both year and month are valid numbers
+  if (isNaN(startYear) || isNaN(startMon)) return null;
+  // JS Date: month is 0-based, so subtract 1 from month and add monthIdx
+  const dueDate = new Date(startYear, startMon - 1 + monthIdx, Number(dueDay));
+  return dueDate;
+}
+
+function getConstantPayoutSchedule(lumpsum, months) {
+  return Array(months).fill(lumpsum);
+}
+
+function calculateVariablePayout(lumpsum, winnerIndex, commissionPercent = 5) {
+  const basePercent = 100 - commissionPercent;
+  const payoutPercent = basePercent + winnerIndex;
+  return Math.round((lumpsum * payoutPercent) / 100);
+}
+
+function getVariablePayoutSchedule(lumpsum, months, commissionPercent = 5) {
+  return Array.from({ length: months }, (_, i) =>
+    calculateVariablePayout(lumpsum, i, commissionPercent)
+  );
+}
+
+// WinnerPicker component
+function WinnerPicker({ members, alreadyWon, onPick }) {
+  const eligible = members.filter(m => !alreadyWon.includes(m.name));
+  if (eligible.length === 0) return null;
+  return (
+    <>
+      <select onChange={e => onPick(e.target.value)} defaultValue="">
+        <option value="" disabled>
+          Pick winner
+        </option>
+        {eligible.map((m, i) => (
+          <option key={i} value={m.name}>
+            {m.name}
+          </option>
+        ))}
+      </select>
+      <button
+        style={{ marginLeft: 6 }}
+        onClick={() => onPick(eligible[Math.floor(Math.random() * eligible.length)].name)}
+      >
+        Random
+      </button>
+    </>
+  );
+}
+
+// Main component
+export default function PaymentSchedule({ 
+  groupId, 
+  members, 
+  months = 12, 
+  lumpsum, 
+  onLockMembers, 
+  startMonth, 
+  dueDay, 
+  paymentBuckets, 
+  chitType: propChitType, 
+  commissionPercent: propCommissionPercent, 
+  manualPayinSchedule: propManualPayinSchedule, 
+  manualPayoutSchedule: propManualPayoutSchedule 
+}) {
+  // Debug logs removed for production
+  
+  const [payments, setPayments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [locked, setLocked] = useState(false);
+
+  // IMPORTANT: Always use props directly to avoid stale state issues
+  const chitType = propChitType || 'constant';
+  const commissionPercent = propCommissionPercent || 5;
+  const manualPayinSchedule = propManualPayinSchedule || [];
+  const manualPayoutSchedule = propManualPayoutSchedule || [];
+
+  // All debug logs removed for production
+
+  // Helper: Get payment amount for a member for a given month
+  function getPaymentAmount(memberName, monthIdx) {
+    // All debug logs removed for production
+
+    // For constant chit type with manual schedule:
+    if (chitType === 'constant') {
+      let winningMonthIdx = -1;
+      for (let i = 0; i < payments.length; i++) {
+        if (payments[i]?.winner === memberName) { // Added safe navigation
+          winningMonthIdx = i;
+          break;
+        }
+      }
+
+      if (winningMonthIdx === -1) {
+        // Member hasn't won yet
+      }
+
+      // If this member has won and this month is after their winning month
+      if (winningMonthIdx !== -1 && monthIdx > winningMonthIdx &&
+          paymentBuckets && paymentBuckets.afterWinning) {
+        const afterWinningValue = Number(paymentBuckets.afterWinning);
+        return afterWinningValue;
+      }
+
+      // For all other cases, use the manual pay-in schedule for this month
+      if (Array.isArray(manualPayinSchedule) && monthIdx < manualPayinSchedule.length) {
+        const rawValue = manualPayinSchedule[monthIdx];
+        if (rawValue !== null && rawValue !== undefined && rawValue !== '') {
+          const amount = Number(rawValue);
+          if (!isNaN(amount)) {
+            return amount;
+          }
+        }
+      }
+
+      // Fallback to 0 if no valid schedule value
+      return 0;
+    }
+    
+    // For variable chit type, use payment buckets:
+    // First, find if this member has won and which month
+    let winningMonthIdx = -1;
+    for (let i = 0; i < payments.length; i++) {
+      if (payments[i]?.winner === memberName) {
+        winningMonthIdx = i;
+        break;
+      }
+    }
+    
+    // Use payment buckets based on relation to winning month
+    const buckets = paymentBuckets || { 
+      beforeWinning: lumpsum, 
+      winningMonth: lumpsum, 
+      afterWinning: lumpsum 
+    };
+    
+    if (winningMonthIdx === -1) {
+      // Member hasn't won yet, use beforeWinning
+      const amount = buckets.beforeWinning || lumpsum;
+      return amount;
+    } else if (monthIdx < winningMonthIdx) {
+      // Month is before winning month, use beforeWinning
+      const amount = buckets.beforeWinning || lumpsum;
+      return amount;
+    } else if (monthIdx === winningMonthIdx) {
+      // Month is winning month, use winningMonth
+      const amount = buckets.winningMonth || lumpsum;
+      return amount;
+    } else {
+      // Month is after winning month, use afterWinning
+      const amount = buckets.afterWinning || lumpsum;
+      return amount;
+    }
+  }
+
+  // Local-first: Fetch from Firestore on initial load, or initialize if missing
+  async function fetchPayments() {
+    setLoading(true);
+    setError('');
+    try {
+      if (!groupId) {
+        throw new Error('No group ID provided');
+      }
+      
+      // Get the group document
+      const docRef = doc(db, 'chitGroups', groupId);
+      const docSnap = await getDoc(docRef);
+      
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        
+        // Check if payments exist
+        if (data.payments && Array.isArray(data.payments)) {
+          setPayments(data.payments);
+          setLocked(data.membersLocked || false);
+        } else {
+          // Initialize payments if not found
+          const initialPayments = getInitialPayments(members, months);
+          setPayments(initialPayments);
+          
+          // Save to Firestore
+          await updateDoc(docRef, { 
+            payments: initialPayments,
+            membersLocked: false
+          });
+        }
+      } else {
+        throw new Error('Group not found');
+      }
+    } catch (err) {
+      setError(`Failed to load payment schedule: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Update when props change
+  useEffect(() => {
+    // Critical props changed, refreshing payments
+    
+    // If members are empty, don't try to fetch/initialize
+    if (!members || members.length === 0) {
+      setLoading(false);
+      return;
+    }
+    
+    fetchPayments();
+  }, [groupId, members.length, months, chitType, lumpsum]);
+
+  // Handle locking members
+  useEffect(() => {
+    if (locked && onLockMembers) {
+      onLockMembers();
+    }
+  }, [locked, onLockMembers]);
+
+  if (loading) {
+    return (
+      <div style={{ padding: 20, textAlign: 'center' }}>
+        Loading payment schedule...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ padding: 20, color: 'red' }}>
+        Error: {error}
+      </div>
+    );
+  }
+
+  // Update payment status and amount for a member in a month
+  async function handlePaymentUpdate(monthIdx, memberIdx, amount = null, setPaid = true) {
+    try {
+      // Get the expected amount for this member/month
+      const memberName = payments[monthIdx]?.payments[memberIdx]?.memberName;
+      const expectedAmount = memberName ? getPaymentAmount(memberName, monthIdx) : null;
+      
+      const updated = payments.map((row, i) =>
+        i === monthIdx
+          ? {
+              ...row,
+              payments: row.payments.map((p, j) =>
+                j === memberIdx ? { 
+                  ...p, 
+                  paid: setPaid,
+                  // If setting paid status and amount is null, use expected amount
+                  // Otherwise keep the provided amount
+                  amount: amount !== null ? amount : (setPaid ? expectedAmount : null)
+                } : p
+              )
+            }
+          : row
+      );
+      setPayments(updated);
+      savePaymentsToFirestore(updated);
+      
+      // Lock members after the first month's due date has passed
+      if (monthIdx === 0) {
+        const firstMonthDueDate = getDueDate(startMonth, dueDay, 0);
+        if (firstMonthDueDate && firstMonthDueDate < new Date()) {
+          setLocked(true);
+          
+          // Update Firestore
+          const docRef = doc(db, 'chitGroups', groupId);
+          await updateDoc(docRef, { membersLocked: true });
+          
+          // Notify parent
+          if (onLockMembers) {
+            onLockMembers();
+          }
+        }
+      }
+    } catch (err) {
+      setError(`Failed to update payment: ${err.message}`);
+    }
+  }
+
+  // Firestore sync helper for local-first pattern
+  async function savePaymentsToFirestore(updatedPayments) {
+    try {
+      const docRef = doc(db, 'chitGroups', groupId);
+      await updateDoc(docRef, { payments: updatedPayments });
+    } catch (err) {
+      setError(`Failed to save payment updates: ${err.message}`);
+    }
+  }
+
+  // Pick or set winner
+  async function handleSetWinner(monthIdx, winnerName) {
+    try {
+      // CRITICAL FIX: Force a direct calculation of expected amounts
+      // This ensures we're using the latest values from props
+      function getExpectedAmount(memberName, monthIdx) {
+        // For constant chit type
+        if (chitType === 'constant') {
+          // Find if this member has won and which month
+          let winningMonthIdx = -1;
+          for (let i = 0; i < payments.length; i++) {
+            if (payments[i]?.winner === memberName) {
+              winningMonthIdx = i;
+              break;
+            }
+          }
+          
+          // If this member has won and this month is after their winning month
+          if (winningMonthIdx !== -1 && monthIdx > winningMonthIdx &&
+              paymentBuckets && paymentBuckets.afterWinning) {
+            return Number(paymentBuckets.afterWinning);
+          }
+          
+          // For all other cases, use the manual pay-in schedule for this month
+          if (Array.isArray(manualPayinSchedule) && monthIdx < manualPayinSchedule.length) {
+            const rawValue = manualPayinSchedule[monthIdx];
+            if (rawValue !== null && rawValue !== undefined && rawValue !== '') {
+              const amount = Number(rawValue);
+              if (!isNaN(amount)) {
+                return amount;
+              }
+            }
+          }
+          
+          // Fallback to 0 if no valid schedule value
+          return 0;
+        }
+        
+        // For variable chit type, use payment buckets
+        // First, find if this member has won and which month
+        let winningMonthIdx = -1;
+        for (let i = 0; i < payments.length; i++) {
+          if (payments[i]?.winner === memberName) {
+            winningMonthIdx = i;
+            break;
+          }
+        }
+        
+        // Use payment buckets based on relation to winning month
+        const buckets = paymentBuckets || { 
+          beforeWinning: lumpsum, 
+          winningMonth: lumpsum, 
+          afterWinning: lumpsum 
+        };
+        
+        if (winningMonthIdx === -1) {
+          // Member hasn't won yet, use beforeWinning
+          return buckets.beforeWinning || lumpsum;
+        } else if (monthIdx < winningMonthIdx) {
+          // Month is before winning month, use beforeWinning
+          return buckets.beforeWinning || lumpsum;
+        } else if (monthIdx === winningMonthIdx) {
+          // Month is winning month, use winningMonth
+          return buckets.winningMonth || lumpsum;
+        } else {
+          // Month is after winning month, use afterWinning
+          return buckets.afterWinning || lumpsum;
+        }
+      }
+      
+      // Update the winner for the month
+      const updated = payments.map((row, i) => {
+        if (i === monthIdx) {
+          // Update the winner for this month
+          const updatedRow = { ...row, winner: winnerName };
+          
+          // Also update the expected amounts for all members
+          // This is critical for correct payment tracking
+          const updatedPayments = row.payments.map(p => {
+            // Calculate the expected amount for this member in this month
+            const expectedAmount = getExpectedAmount(p.memberName, monthIdx);
+            
+            return {
+              ...p,
+              expectedAmount: expectedAmount
+            };
+          });
+          
+          return { ...updatedRow, payments: updatedPayments };
+        }
+        return row;
+      });
+      
+      setPayments(updated);
+      savePaymentsToFirestore(updated);
+    } catch (err) {
+      setError(`Failed to set winner: ${err.message}`);
+    }
+  }
+
+  // Get all winners so far
+  const winners = payments
+    .filter(p => p.winner)
+    .map(p => p.winner);
+
+  // Calculate current date for due date comparison
+  const now = new Date();
+
+  return (
+    <div style={{ padding: '0 10px' }}>
+      <h2>Payment Schedule</h2>
+      
+      {error && <div style={{ color: 'red', margin: '10px 0' }}>{error}</div>}
+      
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 20 }}>
+          <thead>
+            <tr>
+              <th style={{ padding: '8px 4px', borderBottom: '2px solid #ddd', textAlign: 'left' }}>Month</th>
+              <th style={{ padding: '8px 4px', borderBottom: '2px solid #ddd', textAlign: 'left' }}>Winner</th>
+              {members.map((member, i) => (
+                <th key={i} style={{ padding: '8px 4px', borderBottom: '2px solid #ddd', textAlign: 'center' }}>
+                  {member.name}
+                </th>
+              ))}
+              <th style={{ padding: '8px 4px', borderBottom: '2px solid #ddd', textAlign: 'center' }}>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {payments.map((row, monthIdx) => {
+              // Calculate due date for this month
+              const dueDate = getDueDate(startMonth, dueDay, monthIdx);
+              const isPastDue = dueDate && dueDate < now;
+              
+              // Calculate payment status
+              const totalCount = row.payments.length;
+              const paidCount = row.payments.filter(p => p.paid).length;
+              const allPaid = paidCount === totalCount;
+              
+              return (
+                <tr key={monthIdx} style={{ 
+                  background: monthIdx % 2 === 0 ? '#f9f9f9' : 'white',
+                  opacity: dueDate && dueDate > now ? 0.7 : 1
+                }}>
+                  <td style={{ padding: '8px 4px', borderBottom: '1px solid #ddd' }}>
+                    {dueDate ? 
+                      `${dueDate.toLocaleString('default', { month: 'short' }).substring(0, 3)} (${row.month})` : 
+                      `Month ${row.month}`
+                    }
+                  </td>
+                  <td style={{ padding: '8px 4px', borderBottom: '1px solid #ddd' }}>
+                    {row.winner ? (
+                      <strong>{row.winner}</strong>
+                    ) : (
+                      <WinnerPicker 
+                        members={members} 
+                        alreadyWon={winners}
+                        onPick={(name) => handleSetWinner(monthIdx, name)}
+                      />
+                    )}
+                  </td>
+                  
+                  {row.payments.map((p, memberIdx) => {
+                    // Calculate expected amount for this member in this month
+                    const expectedAmount = getPaymentAmount(p.memberName, monthIdx);
+                    
+                    // Check if there's a mismatch between paid amount and expected
+                    const amountMismatch = p.paid && p.amount !== expectedAmount;
+                    
+                    return (
+                      <td 
+                        key={memberIdx} 
+                        style={{ 
+                          padding: '8px 4px', 
+                          borderBottom: '1px solid #ddd',
+                          textAlign: 'center'
+                        }}
+                      >
+                        <div style={{ 
+                          display: 'flex', 
+                          flexDirection: 'column',
+                          alignItems: 'center'
+                        }}>
+                          {/* Payment amount display */}
+                          <div>
+                            {p.paid ? (
+                              <span style={{ fontWeight: 'bold' }}>
+                                ₹{p.amount?.toLocaleString() || expectedAmount?.toLocaleString() || '0'}
+                              </span>
+                            ) : (
+                              <span style={{ color: '#666' }}>
+                                ₹{expectedAmount?.toLocaleString() || '0'}
+                              </span>
+                            )}
+                          </div>
+                          
+                          {/* Payment toggle button */}
+                          <button 
+                            onClick={() => handlePaymentUpdate(monthIdx, memberIdx, null, !p.paid)}
+                            style={{
+                              background: p.paid ? '#e0f7fa' : '#f5f5f5',
+                              border: '1px solid #ddd',
+                              borderRadius: '4px',
+                              padding: '2px 6px',
+                              fontSize: '0.8em',
+                              cursor: 'pointer',
+                              marginTop: '4px'
+                            }}
+                          >
+                            {p.paid ? 'Paid' : 'Mark Paid'}
+                          </button>
+                          
+                          {/* Status indicator */}
+                          <div style={{ 
+                            width: '100%',
+                            textAlign: 'center', 
+                            fontSize: '0.85em', 
+                            fontWeight: 'bold',
+                            color: p.paid ? (amountMismatch ? 'orange' : 'green') : (isPastDue ? '#d32f2f' : '#666')
+                          }}>
+                            {p.paid ? (amountMismatch ? 'Mismatch' : 'Paid') : (isPastDue ? 'Overdue' : 'Unpaid')}
+                          </div>
+                          
+                          {/* Warning for amount mismatch */}
+                          {amountMismatch && (
+                            <div style={{ fontSize: '0.8em', color: 'orange' }}>
+                              Expected: ₹{expectedAmount}
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    );
+                  })}
+                  {/* Payment summary column at far right, always after all member cells */}
+                  <td style={{ fontWeight: 'bold', color: allPaid ? 'green' : 'orange', background: allPaid ? '#e0ffe0' : '#fffbe0' }}>
+                    {paidCount}/{totalCount} paid
+                  </td>
+                </tr>
+              );
+            })}
+
+
+            {/* --- Winner Payout Schedule Table --- */}
+            <tr>
+              <td colSpan={members.length + 4} style={{padding: '2em 0'}}>
+                <div style={{ margin: '2em 0', padding: '1em', border: '1px solid #ccc', borderRadius: '8px', background: '#f8f8ff' }}>
+                  <h3>Winner Payout Schedule</h3>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ border: '1px solid #ccc', padding: '4px' }}>Month</th>
+                        <th style={{ border: '1px solid #ccc', padding: '4px' }}>Winner</th>
+                        <th style={{ border: '1px solid #ccc', padding: '4px' }}>Payout Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {/* Winner payout schedule: Use manual if constant chit, else auto logic */}
+                      {(() => {
+                        // Always use the variable payout formula for variable chit groups
+                        if (chitType === 'variable') {
+                          return getVariablePayoutSchedule(lumpsum, months, commissionPercent || 5);
+                        }
+                        // For constant chit groups, ALWAYS use the current lumpsum value
+                        // This ensures the constant payout logic is maintained
+                        if (chitType === 'constant') {
+                          // Simply create an array filled with the current lumpsum value
+                          // This is the essence of a constant payout chit
+                          return Array(Number(months)).fill(Number(lumpsum));
+                        }
+                        return getConstantPayoutSchedule(lumpsum, months);
+                      })().map((payout, idx) => (
+                        <tr key={idx}>
+                          <td style={{ border: '1px solid #ccc', padding: '4px' }}>{idx + 1}</td>
+                          <td style={{ border: '1px solid #ccc', padding: '4px' }}>
+                            {payments[idx]?.winner
+                              ? payments[idx].winner
+                              : <span style={{ color: '#aaa' }}>TBD</span>}
+                          </td>
+                          <td style={{ border: '1px solid #ccc', padding: '4px' }}>
+                            ₹{payout.toLocaleString()}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}

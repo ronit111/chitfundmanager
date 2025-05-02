@@ -1,0 +1,578 @@
+// src/components/PaymentSchedule.js
+// Handles monthly payments and winner selection for each chit group
+
+import React, { useEffect, useState } from 'react';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
+import { db } from '../firebase';
+
+// Helper functions
+function getInitialPayments(members, months) {
+  // Returns an array of objects for each month: { month: 1, payments: [{memberName, paid:false, amount:null}], winner: null }
+  return Array.from({ length: months }, (_, i) => ({
+    month: i + 1,
+    payments: members.map(m => ({ memberName: m.name, paid: false, amount: null })),
+    winner: null
+  }));
+}
+
+function getDueDate(startMonth, dueDay, monthIdx) {
+  // Ensure startMonth is a non-empty string and dueDay is provided
+  if (!startMonth || typeof startMonth !== 'string' || !dueDay) return null;
+  // Split startMonth string (e.g., '2025-05') into year and month
+  const [startYear, startMon] = startMonth.split('-').map(Number);
+  // Check that both year and month are valid numbers
+  if (isNaN(startYear) || isNaN(startMon)) return null;
+  // JS Date: month is 0-based, so subtract 1 from month and add monthIdx
+  const dueDate = new Date(startYear, startMon - 1 + monthIdx, Number(dueDay));
+  return dueDate;
+}
+
+function getConstantPayoutSchedule(lumpsum, months) {
+  return Array(months).fill(lumpsum);
+}
+
+function calculateVariablePayout(lumpsum, winnerIndex, commissionPercent = 5) {
+  const basePercent = 100 - commissionPercent;
+  const payoutPercent = basePercent + winnerIndex;
+  return Math.round((lumpsum * payoutPercent) / 100);
+}
+
+function getVariablePayoutSchedule(lumpsum, months, commissionPercent = 5) {
+  return Array.from({ length: months }, (_, i) =>
+    calculateVariablePayout(lumpsum, i, commissionPercent)
+  );
+}
+
+// WinnerPicker component
+function WinnerPicker({ members, alreadyWon, onPick }) {
+  const eligible = members.filter(m => !alreadyWon.includes(m.name));
+  if (eligible.length === 0) return null;
+  return (
+    <>
+      <select onChange={e => onPick(e.target.value)} defaultValue="">
+        <option value="" disabled>
+          Pick winner
+        </option>
+        {eligible.map((m, i) => (
+          <option key={i} value={m.name}>
+            {m.name}
+          </option>
+        ))}
+      </select>
+      <button
+        style={{ marginLeft: 6 }}
+        onClick={() => onPick(eligible[Math.floor(Math.random() * eligible.length)].name)}
+      >
+        Random
+      </button>
+    </>
+  );
+}
+
+// Main component
+export default function PaymentSchedule({ 
+  groupId, 
+  members, 
+  months = 12, 
+  lumpsum, 
+  onLockMembers, 
+  startMonth, 
+  dueDay, 
+  paymentBuckets, 
+  chitType: propChitType, 
+  commissionPercent: propCommissionPercent, 
+  manualPayinSchedule: propManualPayinSchedule, 
+  manualPayoutSchedule: propManualPayoutSchedule 
+}) {
+  // Debug log props
+  console.log('PaymentSchedule props:', {
+    groupId,
+    members: members.map(m => m.name),
+    months,
+    lumpsum,
+    chitType: propChitType,
+    paymentBuckets,
+    manualPayinSchedule: propManualPayinSchedule,
+  });
+  
+  const [payments, setPayments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [locked, setLocked] = useState(false);
+
+  // IMPORTANT: Always use props directly to avoid stale state issues
+  const chitType = propChitType || 'constant';
+  const commissionPercent = propCommissionPercent || 5;
+  const manualPayinSchedule = propManualPayinSchedule || [];
+  const manualPayoutSchedule = propManualPayoutSchedule || [];
+
+  // Debug log values
+  console.log('PaymentSchedule using values:', {
+    chitType,
+    manualPayinSchedule,
+    paymentBuckets
+  });
+
+  // Helper: Get payment amount for a member for a given month
+  function getPaymentAmount(memberName, monthIdx) {
+    // DIRECT FIX: For constant chit type, always use the manual pay-in schedule first
+    if (chitType === 'constant') {
+      console.log('CONSTANT CHIT TYPE DETECTED');
+      console.log('Manual pay-in schedule:', manualPayinSchedule);
+      console.log(`Checking month ${monthIdx} for member ${memberName}`);
+      
+      // Find the winning month for this member (0-based)
+      let winningMonthIdx = -1;
+      for (let i = 0; i < payments.length; i++) {
+        if (payments[i].winner === memberName) {
+          winningMonthIdx = i;
+          console.log(`${memberName} won in month ${winningMonthIdx}`);
+          break;
+        }
+      }
+      
+      // If this member has won and this month is after their winning month
+      // AND we have an afterWinning value set, use that instead
+      if (winningMonthIdx !== -1 && monthIdx > winningMonthIdx && 
+          paymentBuckets && typeof paymentBuckets.afterWinning === 'number') {
+        console.log(`Using afterWinning value for ${memberName}: ${paymentBuckets.afterWinning}`);
+        return paymentBuckets.afterWinning;
+      }
+      
+      // Otherwise, try to use the manual pay-in schedule for this month
+      if (Array.isArray(manualPayinSchedule) && monthIdx < manualPayinSchedule.length) {
+        // Convert to number and handle empty strings
+        const amount = Number(manualPayinSchedule[monthIdx]);
+        if (!isNaN(amount)) {
+          console.log(`Using manual schedule for month ${monthIdx}: ${amount}`);
+          return amount;
+        }
+      }
+      // If we couldn't find a valid value in the manual schedule, return a default
+      console.log(`No valid manual schedule entry for month ${monthIdx}, using default`);
+      return 0;
+    }
+    
+    // For variable chit type:
+    // Find the winning month for this member (0-based)
+    let winningMonthIdx = -1;
+    for (let i = 0; i < payments.length; i++) {
+      if (payments[i].winner === memberName) {
+        winningMonthIdx = i;
+        break;
+      }
+    }
+    
+    // Use paymentBuckets if available, else fallback to lumpsum
+    const buckets = paymentBuckets || { beforeWinning: lumpsum, winningMonth: lumpsum, afterWinning: lumpsum };
+    
+    if (winningMonthIdx === -1) {
+      // Member hasn't won yet, use beforeWinning
+      const amount = buckets.beforeWinning || lumpsum;
+      console.log(`${memberName} hasn't won yet, using beforeWinning: ${amount}`);
+      return amount;
+    } else if (monthIdx < winningMonthIdx) {
+      // Month is before winning month, use beforeWinning
+      const amount = buckets.beforeWinning || lumpsum;
+      console.log(`Month ${monthIdx} is before ${memberName}'s winning month ${winningMonthIdx}, using beforeWinning: ${amount}`);
+      return amount;
+    } else if (monthIdx === winningMonthIdx) {
+      // Month is winning month, use winningMonth
+      const amount = buckets.winningMonth || lumpsum;
+      console.log(`Month ${monthIdx} is ${memberName}'s winning month, using winningMonth: ${amount}`);
+      return amount;
+    } else {
+      // Month is after winning month, use afterWinning
+      const amount = buckets.afterWinning || lumpsum;
+      console.log(`Month ${monthIdx} is after ${memberName}'s winning month ${winningMonthIdx}, using afterWinning: ${amount}`);
+      return amount;
+    }
+  }
+
+  // Local-first: Fetch from Firestore on initial load, or initialize if missing
+  async function fetchPayments() {
+    setLoading(true);
+    try {
+      const docRef = doc(db, 'chitGroups', groupId);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists() && docSnap.data().payments) {
+        // Get existing payments but ensure they match the current months count
+        const existingPayments = docSnap.data().payments;
+        
+        // If months changed, we need to resize the payments array
+        if (existingPayments.length !== months) {
+          // Create a new array with the correct length
+          const resizedPayments = Array.from({ length: months }, (_, i) => {
+            if (i < existingPayments.length) {
+              return existingPayments[i];
+            } else {
+              return {
+                month: i + 1,
+                payments: members.map(m => ({ memberName: m.name, paid: false })),
+                winner: null
+              };
+            }
+          });
+          setPayments(resizedPayments);
+        } else {
+          setPayments(existingPayments);
+        }
+      } else {
+        // Initialize with empty payments array
+        const initialPayments = getInitialPayments(members, months);
+        setPayments(initialPayments);
+      }
+    } catch (err) {
+      console.error('Error fetching payments:', err);
+      setError('Failed to load payment data.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Update when props change
+  useEffect(() => {
+    console.log('Critical props changed, refreshing payments', {
+      membersCount: members.length,
+      months,
+      chitType,
+      manualPayinSchedule: Array.isArray(manualPayinSchedule) ? 
+        manualPayinSchedule.map(v => Number(v)) : 'not an array'
+    });
+    
+    if (members.length > 0 && months > 0) {
+      fetchPayments();
+    }
+  }, [members, months, chitType, lumpsum, JSON.stringify(manualPayinSchedule), JSON.stringify(paymentBuckets)]);
+
+  useEffect(() => {
+    if (groupId && members.length > 0) fetchPayments();
+    // eslint-disable-next-line
+  }, [groupId, members, months]);
+
+  // Update payment status and amount for a member in a month
+  async function handlePaymentUpdate(monthIdx, memberIdx, amount = null, setPaid = true) {
+    try {
+      // Get the expected amount for this member/month
+      const memberName = payments[monthIdx]?.payments[memberIdx]?.memberName;
+      const expectedAmount = memberName ? getPaymentAmount(memberName, monthIdx) : null;
+      
+      const updated = payments.map((row, i) =>
+        i === monthIdx
+          ? {
+              ...row,
+              payments: row.payments.map((p, j) =>
+                j === memberIdx ? { 
+                  ...p, 
+                  paid: setPaid,
+                  // If setting paid status and amount is null, use expected amount
+                  // Otherwise keep the provided amount
+                  amount: amount !== null ? amount : (setPaid ? expectedAmount : null)
+                } : p
+              )
+            }
+          : row
+      );
+      setPayments(updated);
+      savePaymentsToFirestore(updated);
+      
+      // Lock members after the first month's due date has passed
+      if (monthIdx === 0) {
+        const dueDate = getDueDate(startMonth, dueDay, 0);
+        const now = new Date();
+        if (dueDate && now > dueDate) {
+          const docRef = doc(db, 'chitGroups', groupId);
+          await updateDoc(docRef, { firstMonthPaidIn: true });
+          setLocked(true); 
+          if (onLockMembers) onLockMembers();
+        }
+      }
+    } catch (err) {
+      setError('Failed to update payment.');
+    }
+  }
+
+  // Firestore sync helper for local-first pattern
+  async function savePaymentsToFirestore(updatedPayments) {
+    try {
+      const docRef = doc(db, 'chitGroups', groupId);
+      await updateDoc(docRef, { payments: updatedPayments });
+    } catch (err) {
+      setError('Failed to save payments.');
+    }
+  }
+
+  // Pick or set winner
+  async function handleSetWinner(monthIdx, winnerName) {
+    try {
+      console.log(`Setting winner for month ${monthIdx} to ${winnerName}`);
+      
+      // When a winner is selected, update all payment amounts for that month
+      const updatedPayments = payments.map((row, i) => {
+        if (i === monthIdx) {
+          // Set winner and update expected payment amounts for all members
+          const updatedPayments = row.payments.map(p => {
+            const expectedAmount = getPaymentAmount(p.memberName, monthIdx);
+            console.log(`Expected amount for ${p.memberName} in month ${monthIdx}: ${expectedAmount}`);
+            return {
+              ...p,
+              expectedAmount
+            };
+          });
+          
+          return {
+            ...row,
+            winner: winnerName,
+            payments: updatedPayments
+          };
+        }
+        return row;
+      });
+      
+      setPayments(updatedPayments);
+      const docRef = doc(db, 'chitGroups', groupId);
+      await updateDoc(docRef, { payments: updatedPayments });
+    } catch (err) {
+      setError('Failed to set winner.');
+    }
+  }
+
+  // Show a friendly message if there are no members
+  if (!members || members.length === 0) {
+    return <div style={{ color: '#444', marginTop: 16 }}>Add members to generate a payment schedule.</div>;
+  }
+
+  // Show loading state
+  if (loading) {
+    return <div style={{ color: '#444', marginTop: 16 }}>Loading payment schedule...</div>;
+  }
+
+  // Calculate group metadata for display
+  const groupStartMonth = typeof startMonth !== 'undefined' ? startMonth : (payments[0]?.startMonth || null);
+  const groupDueDay = typeof dueDay !== 'undefined' ? dueDay : (payments[0]?.dueDay || null);
+  const today = new Date();
+
+  return (
+    <div style={{ marginTop: 24 }}>
+      <h3>Payment Schedule</h3>
+      
+      <div style={{ overflowX: 'auto' }}>
+        <table border="1" cellPadding="6" style={{ borderCollapse: 'collapse', minWidth: 600 }}>
+          <thead>
+            <tr>
+              <th>Month</th>
+              <th>Due Date</th>
+              <th>Winner</th>
+              {members.map((m, i) => (
+                <th key={i}>{m.name}</th>
+              ))}
+              <th>Summary</th>
+            </tr>
+          </thead>
+          <tbody>
+            {payments.map((row, monthIdx) => {
+              // Calculate due date for this month (show '-' if not available)
+              let dueDateStr = '-';
+              let isPastDue = false;
+              if (groupStartMonth && groupDueDay) {
+                const dueDate = getDueDate(groupStartMonth, groupDueDay, monthIdx);
+                if (dueDate) {
+                  dueDateStr = dueDate.toLocaleDateString('en-IN', { 
+                    year: 'numeric', 
+                    month: 'short', 
+                    day: 'numeric' 
+                  });
+                  // Check if due date has passed
+                  isPastDue = dueDate < today;
+                }
+              }
+              
+              // Calculate payment summary stats
+              const paidCount = row.payments.filter(p => p.paid).length;
+              const totalCount = row.payments.length;
+              const allPaid = paidCount === totalCount && totalCount > 0;
+
+              // Calculate month label: 'MonthName (N)'. Use monthIdx for robust calculation (0-based)
+              let monthLabel = '-';
+              if (groupStartMonth) {
+                try {
+                  const [year, month] = groupStartMonth.split('-').map(Number);
+                  const date = new Date(year, month - 1 + monthIdx, 1);
+                  const monthName = date.toLocaleString('default', { month: 'short' });
+                  monthLabel = `${monthName} ${date.getDate()} (${monthIdx + 1})`;
+                } catch (e) {
+                  monthLabel = `Month ${monthIdx + 1}`;
+                }
+              } else {
+                monthLabel = `Month ${monthIdx + 1}`;
+              }
+
+              return (
+                <tr key={monthIdx}>
+                  <td>{monthLabel}</td>
+                  <td style={{ color: isPastDue ? '#d32f2f' : 'inherit' }}>
+                    {dueDateStr}
+                  </td>
+                  <td>
+                    {row.winner ? (
+                      <strong style={{ color: 'green' }}>{row.winner}</strong>
+                    ) : (
+                      <WinnerPicker
+                        members={members}
+                        alreadyWon={payments.slice(0, monthIdx).map(p => p.winner).filter(Boolean)}
+                        onPick={winnerName => handleSetWinner(monthIdx, winnerName)}
+                      />
+                    )}
+                  </td>
+                  
+                  {/* Member payment cells */}
+                  {members.map((m, memberIdx) => {
+                    // Find payment for this member
+                    const p = row.payments.find(p => p.memberName === m.name) || { 
+                      memberName: m.name, 
+                      paid: false, 
+                      amount: null 
+                    };
+                    
+                    // Calculate expected amount for this member
+                    const expectedAmount = getPaymentAmount(m.name, monthIdx);
+                    
+                    // Check if amount mismatches expected
+                    const amountMismatch = p.paid && p.amount !== expectedAmount;
+                    
+                    return (
+                      <td key={memberIdx} style={{ 
+                        border: '1px solid #ccc', 
+                        padding: '8px', 
+                        background: p.paid ? (amountMismatch ? '#fff9e0' : '#e0ffe0') : (isPastDue ? '#ffe0e0' : 'white'),
+                        transition: 'all 0.3s ease'
+                      }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+                          {/* Payment amount display/input */}
+                          <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
+                            <span style={{ marginRight: 4 }}>₹</span>
+                            <input 
+                              type="number" 
+                              style={{
+                                width: '100%',
+                                padding: '6px',
+                                border: amountMismatch ? '1px solid orange' : '1px solid #ccc',
+                                borderRadius: '4px',
+                                textAlign: 'right',
+                                fontWeight: p.paid ? 'bold' : 'normal',
+                                cursor: 'pointer'
+                              }}
+                              value={p.amount !== null ? p.amount : ''}
+                              placeholder={expectedAmount.toString()}
+                              // Lock input for a given month once the subsequent month has started (due date passed)
+                              disabled={(function() {
+                                const now = new Date();
+                                if (monthIdx < payments.length - 1) {
+                                  const nextMonthDueDate = getDueDate(groupStartMonth, groupDueDay, monthIdx + 1);
+                                  if (nextMonthDueDate && now > nextMonthDueDate) {
+                                    return true;
+                                  }
+                                }
+                                return false;
+                              })()}
+                              onChange={(e) => {
+                                const amount = e.target.value ? Number(e.target.value) : null;
+                                // If user enters an amount, automatically mark as paid
+                                // If user clears the amount, mark as unpaid
+                                const setPaid = amount !== null;
+                                handlePaymentUpdate(monthIdx, memberIdx, amount, setPaid);
+                              }}
+                              onFocus={(e) => {
+                                // If field is empty and not paid, show expected amount as a suggestion
+                                if (!p.paid && (p.amount === null || p.amount === '')) {
+                                  e.target.placeholder = expectedAmount.toString();
+                                }
+                              }}
+                            />
+                          </div>
+                          
+                          {/* Status indicator */}
+                          <div style={{ 
+                            width: '100%',
+                            textAlign: 'center', 
+                            fontSize: '0.85em', 
+                            fontWeight: 'bold',
+                            color: p.paid ? (amountMismatch ? 'orange' : 'green') : (isPastDue ? '#d32f2f' : '#666')
+                          }}>
+                            {p.paid ? (amountMismatch ? 'Mismatch' : 'Paid') : (isPastDue ? 'Overdue' : 'Unpaid')}
+                          </div>
+                          
+                          {/* Warning for amount mismatch */}
+                          {amountMismatch && (
+                            <div style={{ fontSize: '0.8em', color: 'orange' }}>
+                              Expected: ₹{expectedAmount}
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    );
+                  })}
+                  {/* Payment summary column at far right, always after all member cells */}
+                  <td style={{ fontWeight: 'bold', color: allPaid ? 'green' : 'orange', background: allPaid ? '#e0ffe0' : '#fffbe0' }}>
+                    {paidCount}/{totalCount} paid
+                  </td>
+                </tr>
+              );
+            })}
+
+
+            {/* --- Winner Payout Schedule Table --- */}
+            <tr>
+              <td colSpan={members.length + 4} style={{padding: '2em 0'}}>
+                <div style={{ margin: '2em 0', padding: '1em', border: '1px solid #ccc', borderRadius: '8px', background: '#f8f8ff' }}>
+                  <h3>Winner Payout Schedule</h3>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ border: '1px solid #ccc', padding: '4px' }}>Month</th>
+                        <th style={{ border: '1px solid #ccc', padding: '4px' }}>Winner</th>
+                        <th style={{ border: '1px solid #ccc', padding: '4px' }}>Payout Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {/* Winner payout schedule: Use manual if constant chit, else auto logic */}
+                      {(() => {
+                        // Always use the variable payout formula for variable chit groups
+                        if (chitType === 'variable') {
+                          return getVariablePayoutSchedule(lumpsum, months, commissionPercent || 5);
+                        }
+                        // For constant chit groups, use manual or default schedule
+                        if (chitType === 'constant' && manualPayoutSchedule && manualPayoutSchedule.length > 0) {
+                          // If manual schedule exists but length doesn't match months, pad or truncate
+                          if (manualPayoutSchedule.length !== months) {
+                            return [...manualPayoutSchedule.slice(0, months), 
+                                    ...Array(Math.max(0, months - manualPayoutSchedule.length))
+                                      .fill(lumpsum)];
+                          }
+                          return manualPayoutSchedule;
+                        }
+                        return getConstantPayoutSchedule(lumpsum, months);
+                      })().map((payout, idx) => (
+                        <tr key={idx}>
+                          <td style={{ border: '1px solid #ccc', padding: '4px' }}>{idx + 1}</td>
+                          <td style={{ border: '1px solid #ccc', padding: '4px' }}>
+                            {payments[idx]?.winner
+                              ? payments[idx].winner
+                              : <span style={{ color: '#aaa' }}>TBD</span>}
+                          </td>
+                          <td style={{ border: '1px solid #ccc', padding: '4px' }}>
+                            ₹{payout.toLocaleString()}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
